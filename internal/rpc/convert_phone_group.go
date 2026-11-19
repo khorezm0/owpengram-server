@@ -315,6 +315,11 @@ func videoRtcpFbs() []map[string]any {
 // 解析方为 tgcalls GroupJoinPayloadInternal/GroupNetworkManager）。要点：
 //   - transport.fingerprints.setup="active"：SFU 是 DTLS 主动握手方；
 //   - candidates 全部字段都是字符串（数值也要写成字符串）；
+//   - audio 节必须存在：tweb SDPBuilder.addSsrcEntry 读 data[type]['payload-types']
+//     无空守卫，缺 audio 即 TypeError（reading 'payload-types'）；opus=111 照抄
+//     客户端本地确定性分配，rtp-hdrexts 只发音频相关扩展（1=audio-level、
+//     2=abs-send-time、3=transport-wide-cc）；presentation 响应多带 audio 无害
+//     （客户端按已知键解析，多余键忽略）；
 //   - video 节即使纯收看也必须存在（缺失则客户端不建任何视频通道）；
 //   - video.endpoint 是**本参与者自己**的视频 endpoint 标识，必须与日后写进其
 //     participant.video.endpoint 的串逐字节一致（客户端靠它做自我过滤）；
@@ -348,6 +353,18 @@ func buildGroupCallConnectionParams(answer sfu.ServerAnswer, endpoint string) (s
 				"setup":       "active",
 			}},
 			"candidates": candidates,
+		},
+		"audio": map[string]any{
+			"payload-types": []map[string]any{
+				{"id": 111, "name": "opus", "clockrate": 48000, "channels": 2,
+					"parameters": map[string]any{"minptime": 10, "useinbandfec": 1},
+					"rtcp-fbs": []map[string]any{{"type": "transport-cc"}}},
+			},
+			"rtp-hdrexts": []map[string]any{
+				{"id": 1, "uri": "urn:ietf:params:rtp-hdrext:ssrc-audio-level"},
+				{"id": 2, "uri": "http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"},
+				{"id": 3, "uri": "http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01"},
+			},
 		},
 		"video": map[string]any{
 			"endpoint": endpoint,

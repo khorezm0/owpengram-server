@@ -256,6 +256,18 @@ func TestGroupCallM0Lifecycle(t *testing.T) {
 			} `json:"fingerprints"`
 			Candidates []any `json:"candidates"`
 		} `json:"transport"`
+		Audio struct {
+			PayloadTypes []struct {
+				ID        int    `json:"id"`
+				Name      string `json:"name"`
+				Clockrate int    `json:"clockrate"`
+				Channels  int    `json:"channels"`
+			} `json:"payload-types"`
+			RtpHdrexts []struct {
+				ID  int    `json:"id"`
+				URI string `json:"uri"`
+			} `json:"rtp-hdrexts"`
+		} `json:"audio"`
 	}
 	if err := json.Unmarshal([]byte(conn.Params.Data), &params); err != nil {
 		t.Fatalf("connection params not parseable: %v\n%s", err, conn.Params.Data)
@@ -270,6 +282,16 @@ func TestGroupCallM0Lifecycle(t *testing.T) {
 	}
 	if len(params.Transport.Candidates) != 0 {
 		t.Fatalf("M0 candidates = %v, want empty", params.Transport.Candidates)
+	}
+	// ⚠ tweb SDPBuilder.addSsrcEntry 读 data.audio['payload-types'] 无空守卫：
+	// join 响应缺 audio 节会 TypeError（reading 'payload-types'）崩溃，必须下发 opus=111。
+	if len(params.Audio.PayloadTypes) == 0 ||
+		params.Audio.PayloadTypes[0].ID != 111 ||
+		params.Audio.PayloadTypes[0].Name != "opus" ||
+		params.Audio.PayloadTypes[0].Clockrate != 48000 ||
+		params.Audio.PayloadTypes[0].Channels != 2 ||
+		len(params.Audio.RtpHdrexts) == 0 {
+		t.Fatalf("audio codec params missing: %s", conn.Params.Data)
 	}
 	joinParts := findUpdate[*tg.UpdateGroupCallParticipants](t, joinRes)
 	if joinParts.Version != 2 || len(joinParts.Participants) != 1 {

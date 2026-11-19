@@ -3,17 +3,21 @@ package sfu
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/pion/datachannel"
 	"github.com/pion/dtls/v3"
 	"github.com/pion/dtls/v3/pkg/crypto/selfsign"
 	dtlsnet "github.com/pion/dtls/v3/pkg/net"
 	"github.com/pion/ice/v4"
+	"github.com/pion/logging"
 	"github.com/pion/rtp"
+	"github.com/pion/sctp"
 	"github.com/pion/srtp/v3"
 	"go.uber.org/zap/zaptest"
 )
@@ -31,6 +35,7 @@ type fakeTgcallsClient struct {
 	ssrc        uint32
 	groups      []SsrcGroup
 
+	dtls    *dtls.Conn // data channel（SCTP over DTLS）复用同一条 DTLS
 	session *srtp.SessionSRTP
 	write   *srtp.WriteStreamSRTP
 	closeFn []func()
@@ -114,6 +119,7 @@ func (c *fakeTgcallsClient) connect(ctx context.Context, answer ServerAnswer) er
 	if err != nil {
 		return err
 	}
+	c.dtls = dtlsConn
 	hsCtx, hsCancel := context.WithTimeout(ctx, 20*time.Second)
 	err = dtlsConn.HandshakeContext(hsCtx)
 	hsCancel()
@@ -154,6 +160,43 @@ func (c *fakeTgcallsClient) close() {
 	for i := len(c.closeFn) - 1; i >= 0; i-- {
 		c.closeFn[i]()
 	}
+}
+
+// openDataChannel 以 SCTP client 角色建关联并 DCEP OPEN 一条 "data" 通道
+//（与 tweb/tgcalls 同路径：SFU 侧 sctp.Server + datachannel.Accept）。
+func (c *fakeTgcallsClient) openDataChannel(ctx context.Context) (*datachannel.DataChannel, error) {
+	logf := logging.NewDefaultLoggerFactory()
+	logf.DefaultLogLevel = logging.LogLevelError
+	assoc, err := sctp.Client(sctp.Config{NetConn: c.dtls, LoggerFactory: logf})
+	if err != nil {
+		return nil, err
+	}
+	c.closeFn = append(c.closeFn, func() { _ = assoc.Close() })
+	dc, err := datachannel.Dial(assoc, 0, &datachannel.Config{
+		ChannelType:  datachannel.ChannelTypeReliable,
+		Label:         "data",
+		LoggerFactory: logf,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return dc, nil
+}
+
+// sendReceiverVideoConstraints 发一条 tweb streamManager 同形的订阅意愿消息。
+func (c *fakeTgcallsClient) sendReceiverVideoConstraints(dc *datachannel.DataChannel, endpointID string, minHeight, maxHeight int) error {
+	msg := map[string]any{
+		"colibriClass":      "ReceiverVideoConstraints",
+		"constraints":       map[string]any{endpointID: map[string]any{"minHeight": minHeight, "maxHeight": maxHeight}},
+		"defaultConstraints": map[string]any{"maxHeight": 0},
+		"onStageEndpoints":  []string{},
+	}
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return err
+	}
+	_, err = dc.WriteDataChannel(raw, true)
+	return err
 }
 
 // sendOpusPacket 构造带 audio-level 扩展（one-byte header，id=1）的 RTP 包。
@@ -201,8 +244,9 @@ func (c *fakeTgcallsClient) sendVideoPacket(ssrc uint32, seq uint16) error {
 	return err
 }
 
-// 视频选层：发布端三层 simulcast，SFU 只转发 SIM[0] 层（订阅端只为该 ssrc 建
-// 解码 sink，高层包客户端会丢弃，SFU 侧直接终结省下行）。
+// 视频选层（无订阅意愿的缺省行为）：发布端三层 simulcast，订阅端不发
+// ReceiverVideoConstraints 时退回 v1 行为——只收 SIM[0]（订阅端只为该 ssrc 建
+// 解码 sink，高层包客户端会丢弃，SFU 侧不转发省下行）。
 func TestPionSFUForwardsOnlyBaseSimulcastLayer(t *testing.T) {
 	if testing.Short() {
 		t.Skip("e2e sfu test")
@@ -306,6 +350,151 @@ func TestPionSFUForwardsOnlyBaseSimulcastLayer(t *testing.T) {
 		case in := <-got:
 			if in.ssrc == base+2 {
 				t.Fatalf("higher simulcast layer %#x leaked through SFU", in.ssrc)
+			}
+		case <-quiet:
+			_ = svc.CloseRoom(ctx, callID)
+			return
+		}
+	}
+}
+
+// 订阅端选层：bob 置顶请求（maxHeight=720）→ 只收顶层；carol 不要视频
+//（maxHeight=0）→ 不收任何视频层。验证 ReceiverVideoConstraints 端到端生效。
+func TestPionSFUSelectsLayerPerSubscriber(t *testing.T) {
+	if testing.Short() {
+		t.Skip("e2e sfu test")
+	}
+	port := pickUDPPort(t)
+	svc, err := NewPion(PionConfig{UDPPort: port, AdvertiseIP: "127.0.0.1", Logger: zaptest.NewLogger(t)})
+	if err != nil {
+		t.Fatalf("new pion sfu: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const callID = int64(902)
+	alice := newFakeTgcallsClient(t, 0x500)
+	base := alice.ssrc + 1
+	alice.groups = []SsrcGroup{
+		{Semantics: "SIM", Sources: []uint32{base, base + 2, base + 4}},
+		{Semantics: "FID", Sources: []uint32{base, base + 1}},
+		{Semantics: "FID", Sources: []uint32{base + 2, base + 3}},
+		{Semantics: "FID", Sources: []uint32{base + 4, base + 5}},
+	}
+	bob := newFakeTgcallsClient(t, 0x600)
+	carol := newFakeTgcallsClient(t, 0x700)
+	defer alice.close()
+	defer bob.close()
+	defer carol.close()
+
+	answerA, err := svc.Join(ctx, callID, 1, EndpointMain, alice.offer())
+	if err != nil {
+		t.Fatalf("join alice: %v", err)
+	}
+	answerB, err := svc.Join(ctx, callID, 2, EndpointMain, bob.offer())
+	if err != nil {
+		t.Fatalf("join bob: %v", err)
+	}
+	answerC, err := svc.Join(ctx, callID, 3, EndpointMain, carol.offer())
+	if err != nil {
+		t.Fatalf("join carol: %v", err)
+	}
+	errCh := make(chan error, 3)
+	go func() { errCh <- alice.connect(ctx, answerA) }()
+	go func() { errCh <- bob.connect(ctx, answerB) }()
+	go func() { errCh <- carol.connect(ctx, answerC) }()
+	for i := 0; i < 3; i++ {
+		if err := <-errCh; err != nil {
+			t.Fatalf("client connect: %v", err)
+		}
+	}
+
+	// bob 置顶 alice（720 → 顶层）；carol 不要 alice 的视频（0 → 全断）。
+	dcB, err := bob.openDataChannel(ctx)
+	if err != nil {
+		t.Fatalf("bob data channel: %v", err)
+	}
+	defer dcB.Close()
+	if err := bob.sendReceiverVideoConstraints(dcB, fmt.Sprintf("audio-%d", alice.ssrc), 180, 720); err != nil {
+		t.Fatalf("bob send constraints: %v", err)
+	}
+	dcC, err := carol.openDataChannel(ctx)
+	if err != nil {
+		t.Fatalf("carol data channel: %v", err)
+	}
+	defer dcC.Close()
+	if err := carol.sendReceiverVideoConstraints(dcC, fmt.Sprintf("audio-%d", alice.ssrc), 0, 0); err != nil {
+		t.Fatalf("carol send constraints: %v", err)
+	}
+	// 约束经 SCTP 异步落地，留出传播窗口。
+	time.Sleep(500 * time.Millisecond)
+
+	// alice 三层同时发。
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		seq := uint16(1)
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				_ = alice.sendVideoPacket(base, seq)
+				_ = alice.sendVideoPacket(base+2, seq)
+				_ = alice.sendVideoPacket(base+4, seq)
+				seq++
+			}
+		}
+	}()
+
+	// bob 只收顶层（base+4）；观察窗口内绝不能出现低层。carol 一条视频都不能收。
+	bobVideo := make(chan uint32, 8)
+	carolVideo := make(chan uint32, 8)
+	go func() {
+		for ssrc := range carolVideo {
+			t.Errorf("carol received video ssrc %#x despite maxHeight=0", ssrc)
+		}
+	}()
+	acceptLoop := func(c *fakeTgcallsClient, out chan<- uint32) {
+		for {
+			stream, ssrc, err := c.session.AcceptStream()
+			if err != nil {
+				return
+			}
+			out <- ssrc
+			go func() {
+				buf := make([]byte, 1500)
+				for {
+					if _, err := stream.Read(buf); err != nil {
+						return
+					}
+				}
+			}()
+		}
+	}
+	go acceptLoop(bob, bobVideo)
+	go acceptLoop(carol, carolVideo)
+	deadline := time.After(10 * time.Second)
+	sawTop := false
+	for !sawTop {
+		select {
+		case ssrc := <-bobVideo:
+			if ssrc != base+4 {
+				t.Fatalf("bob received ssrc %#x, want only top layer %#x", ssrc, base+4)
+			}
+			sawTop = true
+		case <-deadline:
+			t.Fatalf("bob never received the requested top layer")
+		}
+	}
+	quiet := time.After(2 * time.Second)
+	for {
+		select {
+		case ssrc := <-bobVideo:
+			if ssrc != base+4 {
+				t.Fatalf("bob received ssrc %#x, want only top layer", ssrc)
 			}
 		case <-quiet:
 			_ = svc.CloseRoom(ctx, callID)

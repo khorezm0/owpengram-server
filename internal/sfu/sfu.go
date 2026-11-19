@@ -41,9 +41,8 @@ type ClientOffer struct {
 	Pwd               string
 	FingerprintSHA256 string // 形如 "AA:BB:..."（RFC 4572 hex）
 	// SsrcGroups 是视频 simulcast/RTX 源组（主 join 即带，无论摄像头开关）。
-	// SFU 据此做层选择：订阅端只为 SIM[0]（最低层）建解码 sink，发到其它层
-	// 原始 ssrc 的包会被客户端静默丢弃——v1 转发策略=只转 SIM[0] 层与其 FID
-	// RTX 伙伴，其余层在 SFU 侧丢弃（省下行且行为正确）。
+	// SFU 据此还原层结构（SIM 组 sources 低→高 + FID RTX 对），并按每个
+	// 订阅端 data channel 上的 ReceiverVideoConstraints 逐包选层转发。
 	SsrcGroups []SsrcGroup
 }
 

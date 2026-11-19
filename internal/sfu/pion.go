@@ -65,53 +65,71 @@ type room struct {
 	endpoints map[epKey]*endpoint
 }
 
-// mediaPlan 是一个发布 endpoint 的 ssrc 转发计划（Join 时从 ssrc-groups 算定）：
-// 订阅端只为 SIM[0]（最低层）建解码 sink——只转发该层与其 FID RTX 伙伴，
-// 其余 simulcast 层在 SFU 侧丢弃（客户端反正会丢，转发纯浪费下行）。
+// mediaPlan 是一个发布 endpoint 的视频层结构（Join 时从 ssrc-groups 还原）：
+// layers 是 SIM 组的有序 ssrc 表（低→高）；单层发布（conference 模式）退化为
+// 唯一 FID 组的主流。转发按订阅端 ReceiverVideoConstraints 逐包选层：
+// RTX（FID 对）随其媒体层同进退；音频与未声明 ssrc 不参与选层、恒放行。
 type mediaPlan struct {
 	audioSSRC uint32
-	forward   map[uint32]bool // 转发的视频 ssrc（SIM[0] 层 + 其 RTX）
-	drop      map[uint32]bool // 其余已声明视频 ssrc（高层及其 RTX）
+	layers    []uint32          // SIM 层 ssrc，低→高
+	layerOf   map[uint32]int    // 媒体 ssrc → 层序号
+	rtxOf     map[uint32]uint32 // RTX ssrc → 其媒体 ssrc
+	declared  map[uint32]bool   // ssrc-groups 里出现过的全部视频 ssrc
 }
 
 func buildMediaPlan(offer ClientOffer) mediaPlan {
 	plan := mediaPlan{
 		audioSSRC: offer.AudioSSRC,
-		forward:   make(map[uint32]bool),
-		drop:      make(map[uint32]bool),
+		layerOf:   make(map[uint32]int),
+		rtxOf:     make(map[uint32]uint32),
+		declared:  make(map[uint32]bool),
 	}
-	var primary uint32
 	for _, g := range offer.SsrcGroups {
 		if g.Semantics == "SIM" && len(g.Sources) > 0 {
-			primary = g.Sources[0]
+			plan.layers = append(plan.layers, g.Sources...) // sources 低→高
 			break
 		}
 	}
 	// 单层发布（conference 模式）没有 SIM 组：唯一组的第一个 ssrc 即主流。
-	if primary == 0 && len(offer.SsrcGroups) == 1 && len(offer.SsrcGroups[0].Sources) > 0 {
-		primary = offer.SsrcGroups[0].Sources[0]
+	if len(plan.layers) == 0 && len(offer.SsrcGroups) == 1 && len(offer.SsrcGroups[0].Sources) > 0 {
+		plan.layers = []uint32{offer.SsrcGroups[0].Sources[0]}
+	}
+	for i, ssrc := range plan.layers {
+		plan.layerOf[ssrc] = i
 	}
 	for _, g := range offer.SsrcGroups {
-		for i, ssrc := range g.Sources {
-			keep := ssrc == primary ||
-				(g.Semantics == "FID" && i == 1 && len(g.Sources) == 2 && g.Sources[0] == primary)
-			if keep {
-				plan.forward[ssrc] = true
-			} else if !plan.forward[ssrc] {
-				plan.drop[ssrc] = true
-			}
+		for _, ssrc := range g.Sources {
+			plan.declared[ssrc] = true
 		}
-	}
-	for ssrc := range plan.forward {
-		delete(plan.drop, ssrc)
+		if g.Semantics == "FID" && len(g.Sources) == 2 {
+			plan.rtxOf[g.Sources[1]] = g.Sources[0]
+		}
 	}
 	return plan
 }
 
-// shouldForward 报告该 ssrc 的流是否进入扇出（true）或在 SFU 终结（false）。
-// 未声明的 ssrc 一律转发：音频、未来的探测流——订阅端对无 sink 的包安全丢弃。
-func (p mediaPlan) shouldForward(ssrc uint32) bool {
-	return !p.drop[ssrc]
+// videoLayer 返回已声明视频 ssrc 所属的层（RTX 归属其媒体层）；
+// ok=false 表示未声明（音频/探测流：不参与选层，恒放行）。
+func (p mediaPlan) videoLayer(ssrc uint32) (layer int, ok bool) {
+	if media, isRTX := p.rtxOf[ssrc]; isRTX {
+		layer, ok = p.layerOf[media]
+		return layer, ok
+	}
+	layer, ok = p.layerOf[ssrc]
+	return layer, ok
+}
+
+// layerForMaxHeight 把订阅端 maxHeight 请求映射到层序号。层高按 tweb/tgcalls
+// 的 simulcast 阶梯假设：层 i 高度 = 180 << i（180/360/720）。取不超过请求的
+// 最高层；请求低于最低层高时退到层 0（宁低勿断流）。
+func layerForMaxHeight(maxHeight, layerCount int) int {
+	best := 0
+	for i := 1; i < layerCount; i++ {
+		if 180<<i <= maxHeight {
+			best = i
+		}
+	}
+	return best
 }
 
 type endpoint struct {
@@ -131,6 +149,73 @@ type endpoint struct {
 	lastActivity time.Time
 	connected    bool
 	closeOnce    sync.Once
+
+	// 订阅端视频意愿（data channel 上的 ReceiverVideoConstraints）：
+	// nil = 尚未收到过任何约束，退回 v1 行为（恒最低层）。
+	recvMu sync.RWMutex
+	recv   *receiverConstraints
+}
+
+// videoConstraint 是订阅端对单个 endpoint 的视频请求（Jitsi 语义：
+// maxHeight<=0 = 不要该 endpoint 的视频）。
+type videoConstraint struct {
+	minHeight int
+	maxHeight int
+}
+
+// receiverConstraints 是一条 ReceiverVideoConstraints 消息解析后的快照。
+type receiverConstraints struct {
+	constraints map[string]videoConstraint
+	def         videoConstraint
+}
+
+func (ep *endpoint) setReceiverConstraints(c *receiverConstraints) {
+	ep.recvMu.Lock()
+	ep.recv = c
+	ep.recvMu.Unlock()
+}
+
+// endpointID 与信令面 rpc.groupCallEndpointID 同式（rpc 层铸造并写进
+// participant.video.endpoint / presentation.endpoint）：客户端的
+// ReceiverVideoConstraints 以该串为键，必须逐字节一致。
+func (ep *endpoint) endpointID() string {
+	if ep.kind == EndpointPresentation {
+		return fmt.Sprintf("presentation-%d", ep.plan.audioSSRC)
+	}
+	return fmt.Sprintf("audio-%d", ep.plan.audioSSRC)
+}
+
+// targetLayerFor 返回本端对发布端 endpoint 的目标层：-1 = 不收该 endpoint 的
+// 视频（maxHeight<=0）；从未收到 ReceiverVideoConstraints 时退回 v1 行为
+//（恒最低层）。层高映射见 layerForMaxHeight。
+func (ep *endpoint) targetLayerFor(publisherEndpointID string, layerCount int) int {
+	ep.recvMu.RLock()
+	defer ep.recvMu.RUnlock()
+	if ep.recv == nil {
+		return 0
+	}
+	c, ok := ep.recv.constraints[publisherEndpointID]
+	if !ok {
+		c = ep.recv.def
+	}
+	if c.maxHeight <= 0 {
+		return -1
+	}
+	return layerForMaxHeight(c.maxHeight, layerCount)
+}
+
+// wantsStream 报告订阅端 ep 是否收发布端 from 的该 ssrc 流：音频与未声明
+// ssrc 恒放行（v1 语义）；已声明视频 ssrc（含 RTX）按目标层过滤。
+func (ep *endpoint) wantsStream(from *endpoint, ssrc uint32) bool {
+	if ssrc == from.plan.audioSSRC {
+		return true
+	}
+	layer, ok := from.plan.videoLayer(ssrc)
+	if !ok {
+		return true
+	}
+	target := ep.targetLayerFor(from.endpointID(), len(from.plan.layers))
+	return target >= 0 && layer == target
 }
 
 // NewPion 启动内嵌 SFU：绑定 UDP 端口、生成进程级 DTLS 证书。
@@ -363,12 +448,16 @@ func (s *pionSFU) livenessLoop(ctx context.Context) {
 	}
 }
 
-// forwardRTP 把一条解密后的 RTP 包原样转发给房间内其他参与者的**主** endpoint
-// （不重写 SSRC，扩展头随包透传——audio-level 即 speaking 指示数据源；
+// forwardRTP 把一条解密后的 RTP 包按订阅裁剪后转发给房间内其他参与者的**主**
+// endpoint（不重写 SSRC，扩展头随包透传——audio-level 即 speaking 指示数据源；
 // 观看屏幕共享也走观看者的主连接，presentation 连接不收任何远端流）。
-func (s *pionSFU) forwardRTP(from *endpoint, packet []byte) {
+// 视频流按每个订阅端自己的 ReceiverVideoConstraints 选层：未收到约束的
+// 订阅端退回 v1 行为（恒最低层）。
+func (s *pionSFU) forwardRTP(from *endpoint, ssrc uint32, packet []byte) {
 	for _, ep := range s.mainTargets(from) {
-		ep.writeRTP(packet)
+		if ep.wantsStream(from, ssrc) {
+			ep.writeRTP(packet)
+		}
 	}
 }
 
@@ -399,7 +488,7 @@ func (s *pionSFU) publisherBySSRC(callID int64, ssrc uint32) *endpoint {
 		return nil
 	}
 	for _, ep := range rm.endpoints {
-		if ep.plan.audioSSRC == ssrc || ep.plan.forward[ssrc] || ep.plan.drop[ssrc] {
+		if ep.plan.audioSSRC == ssrc || ep.plan.declared[ssrc] {
 			return ep
 		}
 	}
@@ -522,20 +611,15 @@ func (ep *endpoint) run(offer ClientOffer) {
 	// SCTP 数据通道骑在同一条 DTLS 连接上（握手后的 application data 即 SCTP 包）。
 	go ep.serveData(dtlsConn)
 
-	// 入站 SRTP：按 SSRC 接收流。转发/终结决策在流粒度一次性做出
-	//（AcceptStream 即按 SSRC 分流，selective forwarding 零每包开销）。
+	// 入站 SRTP：全部流进入转发路径——视频层的取舍是逐包按订阅端过滤
+	//（readStream→forwardRTP），音频与未声明 ssrc 恒放行。
 	for {
 		stream, ssrc, err := session.AcceptStream()
 		if err != nil {
 			ep.close()
 			return
 		}
-		if ep.plan.shouldForward(ssrc) {
-			go ep.readStream(stream, ssrc)
-		} else {
-			// 非转发层（高层 simulcast 及其 RTX）：必须持续排空防 buffer 堆积。
-			go ep.drainStream(stream)
-		}
+		go ep.readStream(stream, ssrc)
 	}
 }
 
@@ -549,17 +633,7 @@ func (ep *endpoint) readStream(stream *srtp.ReadStreamSRTP, ssrc uint32) {
 		ep.markActivity()
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
-		ep.sfu.forwardRTP(ep, packet)
-	}
-}
-
-func (ep *endpoint) drainStream(stream *srtp.ReadStreamSRTP) {
-	buf := make([]byte, 1500)
-	for {
-		if _, err := stream.Read(buf); err != nil {
-			return
-		}
-		ep.markActivity()
+		ep.sfu.forwardRTP(ep, ssrc, packet)
 	}
 }
 
@@ -636,8 +710,8 @@ func (ep *endpoint) writeRTCP(pkt rtcp.Packet) {
 //   - 客户端总是 SCTP INIT 与 DATA_CHANNEL_OPEN 的发起方（sid=0, label="data"），
 //     SFU 绝不主动 OPEN（客户端没有 accept 入站 OPEN 的逻辑）；
 //   - 关联被客户端重建（restartDataChannel）时在同一 DTLS 上重新 accept；
-//   - 数据通道上没有任何消息是音视频工作的硬前置：v1 只消费（记录）
-//     ReceiverVideoConstraints，其余忽略。
+//   - 数据通道上没有任何消息是音视频工作的硬前置：v2 消费
+//     ReceiverVideoConstraints（订阅端选层意愿），其余消息忽略。
 func (ep *endpoint) serveData(conn *dtls.Conn) {
 	logf := logging.NewDefaultLoggerFactory()
 	logf.DefaultLogLevel = logging.LogLevelError
@@ -679,12 +753,33 @@ func (ep *endpoint) serveDataChannel(dc *datachannel.DataChannel) {
 		ep.markActivity()
 		var msg struct {
 			ColibriClass string `json:"colibriClass"`
+			Constraints   map[string]struct {
+				MinHeight int `json:"minHeight"`
+				MaxHeight int `json:"maxHeight"`
+			} `json:"constraints"`
+			DefaultConstraints struct {
+				MaxHeight int `json:"maxHeight"`
+			} `json:"defaultConstraints"`
+			OnStageEndpoints []string `json:"onStageEndpoints"`
 		}
 		if err := json.Unmarshal(buf[:n], &msg); err != nil {
 			continue
 		}
-		// v1：ReceiverVideoConstraints 仅记录（转发策略固定为 SIM[0] 层广播，
-		// 客户端对未订阅 endpoint 的包安全丢弃）；选层/按订阅裁剪留下一轮。
+		// ReceiverVideoConstraints（tweb streamManager / tgcalls 同源，Jitsi
+		// colibri 语义）：constraints 按发布端 endpoint 键控，defaultConstraints
+		// 兜底未列出的 endpoint（maxHeight<=0 = 不要）。onStageEndpoints 仅记录，
+		// 选层以 constraints 为准（pinned 的 ask 已在 constraints 里）。
+		if msg.ColibriClass == "ReceiverVideoConstraints" {
+			c := &receiverConstraints{
+				constraints: make(map[string]videoConstraint, len(msg.Constraints)),
+				def:         videoConstraint{maxHeight: msg.DefaultConstraints.MaxHeight},
+			}
+			for endpointID, constraint := range msg.Constraints {
+				c.constraints[endpointID] = videoConstraint{minHeight: constraint.MinHeight, maxHeight: constraint.MaxHeight}
+			}
+			ep.setReceiverConstraints(c)
+			continue
+		}
 		ep.sfu.log.Debug("sfu data channel message",
 			zap.Int64("call_id", ep.callID),
 			zap.Int64("user_id", ep.userID),
