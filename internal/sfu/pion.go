@@ -3,18 +3,23 @@ package sfu
 import (
 	"context"
 	"crypto/tls"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/datachannel"
 	"github.com/pion/dtls/v3"
 	dtlsnet "github.com/pion/dtls/v3/pkg/net"
 	"github.com/pion/ice/v4"
+	"github.com/pion/interceptor/pkg/twcc"
 	"github.com/pion/logging"
 	"github.com/pion/rtcp"
+	"github.com/pion/rtp"
 	"github.com/pion/sctp"
 	"github.com/pion/srtp/v3"
 	"go.uber.org/zap"
@@ -39,8 +44,9 @@ type PionConfig struct {
 }
 
 // pionSFU 是 Service 的 pion 实现：full-ICE CONTROLLING + DTLS 主动握手（client
-// 角色，对应下行 setup:"active"）+ SRTP 房间内原样转发（不重写 SSRC、保留
-// audio-level 等 RTP 扩展，speaking 指示由客户端渲染）。
+// 角色，对应下行 setup:"active"）+ SRTP 房间内转发（保留 audio-level 等 RTP
+// 扩展，speaking 指示由客户端渲染）。音频原样转发；视频选层后改写到发布端 SIM[0]
+// ssrc（见 rewrite.go）。
 type pionSFU struct {
 	cfg         PionConfig
 	log         *zap.Logger
@@ -75,6 +81,9 @@ type mediaPlan struct {
 	layerOf   map[uint32]int    // 媒体 ssrc → 层序号
 	rtxOf     map[uint32]uint32 // RTX ssrc → 其媒体 ssrc
 	declared  map[uint32]bool   // ssrc-groups 里出现过的全部视频 ssrc
+	// 每个已声明视频 ssrc 的最近 RTP 时刻（unix nano）。「宁低勿断流」回退
+	// 用它判断哪些层真的在发包：请求的层没有流时退到最高的在发层。
+	lastPacket map[uint32]*atomic.Int64
 }
 
 func buildMediaPlan(offer ClientOffer) mediaPlan {
@@ -105,7 +114,36 @@ func buildMediaPlan(offer ClientOffer) mediaPlan {
 			plan.rtxOf[g.Sources[1]] = g.Sources[0]
 		}
 	}
+	plan.lastPacket = make(map[uint32]*atomic.Int64, len(plan.declared))
+	for ssrc := range plan.declared {
+		plan.lastPacket[ssrc] = new(atomic.Int64)
+	}
 	return plan
+}
+
+// layerActiveWindow 内有 RTP 的层视为「在发」；与 tgcalls 的约束降级延迟
+// （2s）同量级——发布端按 SenderVideoConstraints 停发高层后，订阅端在
+// 同一窗口内回退到低层，不断流。
+const layerActiveWindow = 2 * time.Second
+
+// transport-wide-cc 的 RTP 头扩展 id（与下行 SDP buildGroupCallConnectionParams
+// 的 rtp-hdrexts 一致：客户端硬编码 id=3）。SFU 用它从发布端 RTP 取传输层序号。
+const transportWideCCExtID = 3
+
+// bestActiveLayer 返回最近窗口内真正在发包的最高层；没有任何层在发时
+// 返回 0（层 0 的首包在转发判定前已记录，正常流不会走到全无分支）。
+func (p mediaPlan) bestActiveLayer() int {
+	best := -1
+	now := time.Now().UnixNano()
+	for i, ssrc := range p.layers {
+		if t := p.lastPacket[ssrc]; t != nil && now-t.Load() < int64(layerActiveWindow) {
+			best = i
+		}
+	}
+	if best < 0 {
+		return 0
+	}
+	return best
 }
 
 // videoLayer 返回已声明视频 ssrc 所属的层（RTX 归属其媒体层）；
@@ -154,6 +192,11 @@ type endpoint struct {
 	// nil = 尚未收到过任何约束，退回 v1 行为（恒最低层）。
 	recvMu sync.RWMutex
 	recv   *receiverConstraints
+
+	// 订阅端对各发布端 endpoint 的视频改写状态（endpointID→forwarder）：选中层
+	// 改写到发布端 SIM[0] ssrc 上（见 rewrite.go）。
+	fwdMu sync.Mutex
+	fwd   map[string]*videoForwarder
 }
 
 // videoConstraint 是订阅端对单个 endpoint 的视频请求（Jitsi 语义：
@@ -187,7 +230,7 @@ func (ep *endpoint) endpointID() string {
 
 // targetLayerFor 返回本端对发布端 endpoint 的目标层：-1 = 不收该 endpoint 的
 // 视频（maxHeight<=0）；从未收到 ReceiverVideoConstraints 时退回 v1 行为
-//（恒最低层）。层高映射见 layerForMaxHeight。
+// （恒最低层）。层高映射见 layerForMaxHeight。
 func (ep *endpoint) targetLayerFor(publisherEndpointID string, layerCount int) int {
 	ep.recvMu.RLock()
 	defer ep.recvMu.RUnlock()
@@ -204,18 +247,22 @@ func (ep *endpoint) targetLayerFor(publisherEndpointID string, layerCount int) i
 	return layerForMaxHeight(c.maxHeight, layerCount)
 }
 
-// wantsStream 报告订阅端 ep 是否收发布端 from 的该 ssrc 流：音频与未声明
-// ssrc 恒放行（v1 语义）；已声明视频 ssrc（含 RTX）按目标层过滤。
-func (ep *endpoint) wantsStream(from *endpoint, ssrc uint32) bool {
-	if ssrc == from.plan.audioSSRC {
-		return true
-	}
-	layer, ok := from.plan.videoLayer(ssrc)
-	if !ok {
-		return true
-	}
+// desiredLayer 返回订阅端 ep 当前应收发布端 from 的视频层（-1 = 不要视频）。
+func (ep *endpoint) desiredLayer(from *endpoint) int {
 	target := ep.targetLayerFor(from.endpointID(), len(from.plan.layers))
-	return target >= 0 && layer == target
+	if target < 0 {
+		return -1
+	}
+	// 请求层从未发过包（发布端只编低层/尚未升上来）：回退到最高的在发层，
+	// 避免黑屏。
+	if target < len(from.plan.layers) {
+		if t := from.plan.lastPacket[from.plan.layers[target]]; t == nil || t.Load() == 0 {
+			return from.plan.bestActiveLayer()
+		}
+	}
+	// 请求层一旦发过包就锁定它：屏幕共享静态画面会让高层短暂停发，停发期间
+	// 保持最后一帧，不来回切层。
+	return target
 }
 
 // NewPion 启动内嵌 SFU：绑定 UDP 端口、生成进程级 DTLS 证书。
@@ -449,16 +496,61 @@ func (s *pionSFU) livenessLoop(ctx context.Context) {
 }
 
 // forwardRTP 把一条解密后的 RTP 包按订阅裁剪后转发给房间内其他参与者的**主**
-// endpoint（不重写 SSRC，扩展头随包透传——audio-level 即 speaking 指示数据源；
-// 观看屏幕共享也走观看者的主连接，presentation 连接不收任何远端流）。
-// 视频流按每个订阅端自己的 ReceiverVideoConstraints 选层：未收到约束的
+// endpoint（扩展头随包透传——audio-level 即 speaking 指示数据源；观看屏幕共享也
+// 走观看者的主连接，presentation 连接不收任何远端流）。音频与未声明 ssrc 原样
+// 转发；已声明视频按每个订阅端的 ReceiverVideoConstraints 选层，并改写到发布端
+// SIM[0] ssrc 上（订阅端只为 SIM[0] 建接收流，见 rewrite.go）。未收到约束的
 // 订阅端退回 v1 行为（恒最低层）。
 func (s *pionSFU) forwardRTP(from *endpoint, ssrc uint32, packet []byte) {
+	layer, isVideo := from.plan.videoLayer(ssrc)
+	now := time.Now()
 	for _, ep := range s.mainTargets(from) {
-		if ep.wantsStream(from, ssrc) {
+		if !isVideo {
 			ep.writeRTP(packet)
+			continue
+		}
+		f := ep.forwarderFor(from)
+		res := f.forward(ssrc, layer, ep.desiredLayer(from), packet, now)
+		if res.pliSSRC != 0 {
+			from.writeRTCP(&rtcp.PictureLossIndication{MediaSSRC: res.pliSSRC})
+		}
+		if res.out != nil {
+			ep.writeRTP(res.out)
 		}
 	}
+}
+
+// forwarderFor 返回（按需创建）订阅端 ep 对发布端 from 的视频改写状态。以
+// 发布端指针校验：发布端 rejoin 后 endpoint ID 不变但层结构可能变。
+func (ep *endpoint) forwarderFor(from *endpoint) *videoForwarder {
+	key := from.endpointID()
+	ep.fwdMu.Lock()
+	defer ep.fwdMu.Unlock()
+	if ep.fwd == nil {
+		ep.fwd = make(map[string]*videoForwarder)
+	}
+	f := ep.fwd[key]
+	if f == nil || f.pub != from {
+		f = newVideoForwarder(from)
+		ep.fwd[key] = f
+	}
+	return f
+}
+
+// forwarderByOutSSRC 找到输出 ssrc（发布端 SIM[0] 或其 RTX）为该值的改写状态，
+// 供订阅端 RTCP（PLI/NACK）反查源层。
+func (ep *endpoint) forwarderByOutSSRC(ssrc uint32) *videoForwarder {
+	ep.fwdMu.Lock()
+	defer ep.fwdMu.Unlock()
+	if ssrc == 0 {
+		return nil
+	}
+	for _, f := range ep.fwd {
+		if f.outSSRC == ssrc || (f.outRTX != 0 && f.outRTX == ssrc) {
+			return f
+		}
+	}
+	return nil
 }
 
 // mainTargets 返回房间内除 from 所属参与者外的全部主 endpoint。
@@ -611,6 +703,12 @@ func (ep *endpoint) run(offer ClientOffer) {
 	// SCTP 数据通道骑在同一条 DTLS 连接上（握手后的 application data 即 SCTP 包）。
 	go ep.serveData(dtlsConn)
 
+	// transport-cc 终结：按本端收到的发布端 RTP 生成 TWCC 反馈回投（见
+	// publisherTWCC）。记录与转发解耦，反馈写绝不阻塞转发。生命周期绑在本
+	// goroutine：run 退出即 close，避免与 close() 竞争共享字段。
+	twccFB := newPublisherTWCC(ep)
+	defer twccFB.close()
+
 	// 入站 SRTP：全部流进入转发路径——视频层的取舍是逐包按订阅端过滤
 	//（readStream→forwardRTP），音频与未声明 ssrc 恒放行。
 	for {
@@ -619,18 +717,99 @@ func (ep *endpoint) run(offer ClientOffer) {
 			ep.close()
 			return
 		}
-		go ep.readStream(stream, ssrc)
+		go ep.readStream(stream, ssrc, twccFB)
 	}
 }
 
-func (ep *endpoint) readStream(stream *srtp.ReadStreamSRTP, ssrc uint32) {
+// publisherTWCC 终结 transport-cc：记录本端收到的发布端 RTP 的传输层序号，
+// 周期性生成 TWCC 反馈写回发布端。发布端→SFU 这段没有选层裁剪，序号连续，
+// 反馈如实反映链路带宽——发布端的带宽估计据此升码率、编高层。
+//
+// 记录与转发彻底解耦：record 只做非阻塞通道投递（满则丢），Record/生成/
+// RTCP 写全部在独立的 loop goroutine。带宽反馈的任何阻塞或耗时都绝不拖住
+// readStream 的转发路径（否则一次写阻塞/一次大反馈生成就会卡死整个发布端
+// 的所有流，表现为观看端画面冻结）。
+type twccRecord struct {
+	ssrc    uint32
+	seq     uint16
+	arrival int64
+}
+
+type publisherTWCC struct {
+	ep    *endpoint
+	rec   *twcc.Recorder
+	start time.Time
+	ch    chan twccRecord
+	stop  chan struct{}
+	done  chan struct{}
+}
+
+func newPublisherTWCC(ep *endpoint) *publisherTWCC {
+	f := &publisherTWCC{
+		ep:    ep,
+		rec:   twcc.NewRecorder(rand.Uint32()),
+		start: time.Now(),
+		ch:    make(chan twccRecord, 1024),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
+	go f.loop()
+	return f
+}
+
+// record 由 readStream 逐包调用：非阻塞投递，通道满即丢弃该条记录。宁可
+// 反馈少报（发布端略降码率），也绝不阻塞转发。同一 endpoint 的全部流（音频/
+// 各视频层/RTX）共享一个记录器：传输层序号本就跨流连续，合并记录才不会把
+// 选层裁剪误报成丢包。recorder 仅由 loop 单 goroutine 访问，无需加锁。
+func (f *publisherTWCC) record(ssrc uint32, seq uint16) {
+	select {
+	case f.ch <- twccRecord{ssrc: ssrc, seq: seq, arrival: time.Since(f.start).Microseconds()}:
+	default:
+	}
+}
+
+func (f *publisherTWCC) loop() {
+	defer close(f.done)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-f.stop:
+			return
+		case p := <-f.ch:
+			f.rec.Record(p.ssrc, p.seq, p.arrival)
+		case <-ticker.C:
+			for _, pkt := range f.rec.BuildFeedbackPacket() {
+				f.ep.writeRTCP(pkt)
+			}
+		}
+	}
+}
+
+func (f *publisherTWCC) close() {
+	close(f.stop)
+	<-f.done
+}
+
+func (ep *endpoint) readStream(stream *srtp.ReadStreamSRTP, ssrc uint32, twccFB *publisherTWCC) {
 	buf := make([]byte, 1500)
+	var hdr rtp.Header
 	for {
 		n, err := stream.Read(buf)
 		if err != nil {
 			return
 		}
 		ep.markActivity()
+		if t := ep.plan.lastPacket[ssrc]; t != nil {
+			t.Store(time.Now().UnixNano())
+		}
+		if twccFB != nil {
+			if _, herr := hdr.Unmarshal(buf[:n]); herr == nil {
+				if ext := hdr.GetExtension(transportWideCCExtID); len(ext) >= 2 {
+					twccFB.record(ssrc, binary.BigEndian.Uint16(ext[:2]))
+				}
+			}
+		}
 		packet := make([]byte, n)
 		copy(packet, buf[:n])
 		ep.sfu.forwardRTP(ep, ssrc, packet)
@@ -642,8 +821,14 @@ func (ep *endpoint) readStream(stream *srtp.ReadStreamSRTP, ssrc uint32) {
 //     恒等转发下订阅端反馈里的 ssrc 就是发布端的原始 ssrc，无需改写；
 //     发布端自带 RTX 重传与 300ms keyframe 限流；
 //   - SR（发布端报告）→ 转发给其他主 endpoint（A/V 同步的 NTP↔RTP 映射来源）；
-//   - RR / REMB / transport-cc：丢弃（v1 不做带宽自适应；layer0 所需码率
-//     远低于发布端 400kbps 起始值，不会饿死）。
+//   - RR（订阅端接收报告）→ 按 media ssrc 回投发布端：订阅端只收被选中的层，
+//     该层的 RR 干净（无选层裁剪丢包），给发布端提供接收端存活/RTT/丢包信号；
+//   - REMB / transport-cc（订阅端带宽反馈）→ 丢弃，不回投。订阅端只收到被选层
+//     裁剪后的流：其 transport-cc 把 SFU 故意丢的其它层报成丢包，REMB 只反映
+//     低层接收码率——回投会让发布端带宽估计崩塌/被压低、停编高层（屏幕共享
+//     升 720p 即黑屏回落 360p 的根因）。发布端带宽反馈由 SFU 自产：publisherTWCC
+//     按发布端→SFU 这段（无裁剪、序号连续）的收包回投 transport-cc，如实反映
+//     链路带宽，发布端据此升码率、编高层。
 func (ep *endpoint) serveRTCP(session *srtp.SessionSRTCP) {
 	for {
 		stream, _, err := session.AcceptStream()
@@ -672,16 +857,61 @@ func (ep *endpoint) routeRTCP(pkts []rtcp.Packet) {
 	for _, pkt := range pkts {
 		switch fb := pkt.(type) {
 		case *rtcp.PictureLossIndication:
-			ep.sfu.writeRTCPToPublisher(ep.callID, fb.MediaSSRC, pkt)
+			ep.routeKeyframeRequest(fb.MediaSSRC, pkt)
 		case *rtcp.FullIntraRequest:
-			ep.sfu.writeRTCPToPublisher(ep.callID, fb.MediaSSRC, pkt)
+			ep.routeKeyframeRequest(fb.MediaSSRC, pkt)
 		case *rtcp.TransportLayerNack:
-			ep.sfu.writeRTCPToPublisher(ep.callID, fb.MediaSSRC, pkt)
+			ep.routeNACK(fb)
+		case *rtcp.ReceiverReport:
+			if len(fb.Reports) > 0 {
+				ep.sfu.writeRTCPToPublisher(ep.callID, fb.Reports[0].SSRC, pkt)
+			}
 		case *rtcp.SenderReport:
+			// 视频层 SR 按各订阅端的改写状态换算（只转当前层）；音频等原样转发。
+			_, isVideo := ep.plan.videoLayer(fb.SSRC)
 			for _, target := range ep.sfu.mainTargets(ep) {
-				target.writeRTCP(pkt)
+				if !isVideo {
+					target.writeRTCP(pkt)
+					continue
+				}
+				if sr := target.forwarderFor(ep).translateSR(fb); sr != nil {
+					target.writeRTCP(sr)
+				}
 			}
 		}
+	}
+}
+
+// routeKeyframeRequest：订阅端对改写后输出 ssrc 的 PLI/FIR 转成对源层的 PLI
+// （待切层优先）；其它 ssrc（未改写的流）按原 ssrc 路由。
+func (ep *endpoint) routeKeyframeRequest(mediaSSRC uint32, pkt rtcp.Packet) {
+	if f := ep.forwarderByOutSSRC(mediaSSRC); f != nil {
+		if src := f.keyframeSSRC(); src != 0 {
+			f.pub.writeRTCP(&rtcp.PictureLossIndication{MediaSSRC: src})
+		}
+		return
+	}
+	ep.sfu.writeRTCPToPublisher(ep.callID, mediaSSRC, pkt)
+}
+
+// routeNACK：订阅端 NACK 的是输出序号空间，按改写历史还原成 源层 ssrc + 源序号
+// 后转投发布端（发布端自带 RTX 重传，重传包再经 rewriteRTX 改写回来）。
+func (ep *endpoint) routeNACK(fb *rtcp.TransportLayerNack) {
+	f := ep.forwarderByOutSSRC(fb.MediaSSRC)
+	if f == nil {
+		ep.sfu.writeRTCPToPublisher(ep.callID, fb.MediaSSRC, fb)
+		return
+	}
+	var seqs []uint16
+	for i := range fb.Nacks {
+		seqs = append(seqs, fb.Nacks[i].PacketList()...)
+	}
+	for srcSSRC, srcSeqs := range f.translateNACK(seqs) {
+		f.pub.writeRTCP(&rtcp.TransportLayerNack{
+			SenderSSRC: fb.SenderSSRC,
+			MediaSSRC:  srcSSRC,
+			Nacks:      rtcp.NackPairsFromSequenceNumbers(srcSeqs),
+		})
 	}
 }
 
@@ -753,7 +983,7 @@ func (ep *endpoint) serveDataChannel(dc *datachannel.DataChannel) {
 		ep.markActivity()
 		var msg struct {
 			ColibriClass string `json:"colibriClass"`
-			Constraints   map[string]struct {
+			Constraints  map[string]struct {
 				MinHeight int `json:"minHeight"`
 				MaxHeight int `json:"maxHeight"`
 			} `json:"constraints"`

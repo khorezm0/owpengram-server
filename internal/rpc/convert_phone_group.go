@@ -358,7 +358,7 @@ func buildGroupCallConnectionParams(answer sfu.ServerAnswer, endpoint string) (s
 			"payload-types": []map[string]any{
 				{"id": 111, "name": "opus", "clockrate": 48000, "channels": 2,
 					"parameters": map[string]any{"minptime": 10, "useinbandfec": 1},
-					"rtcp-fbs": []map[string]any{{"type": "transport-cc"}}},
+					"rtcp-fbs":   []map[string]any{{"type": "transport-cc"}}},
 			},
 			"rtp-hdrexts": []map[string]any{
 				{"id": 1, "uri": "urn:ietf:params:rtp-hdrext:ssrc-audio-level"},

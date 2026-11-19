@@ -26,7 +26,7 @@ func (r *Router) onPhoneEditGroupCallParticipant(ctx context.Context, req *tg.Ph
 	if err != nil {
 		return nil, err
 	}
-	targetID, err := r.groupCallParticipantTarget(ctx, scope.userID, req.Participant)
+	targetID, err := r.groupCallParticipantTarget(ctx, scope, req.Participant)
 	if err != nil {
 		return nil, err
 	}
@@ -317,14 +317,49 @@ func (r *Router) onPhoneInviteToGroupCall(ctx context.Context, req *tg.PhoneInvi
 	return out, nil
 }
 
-// groupCallParticipantTarget 解析 editGroupCallParticipant 的目标（仅 user peer）。
-func (r *Router) groupCallParticipantTarget(ctx context.Context, currentUserID int64, peer tg.InputPeerClass) (int64, error) {
+// groupCallParticipantTarget 解析 editGroupCallParticipant 的目标。self/user peer
+// 直接取 user id；channel peer 是「以频道身份入会」的行——tweb/TDesktop 对自己
+// join-as 的行发 joinAs()->input()（开关摄像头/静音/举手全走它），对他人的频道
+// 身份行发其 peer（admin 禁言/成员本地音量）。
+func (r *Router) groupCallParticipantTarget(ctx context.Context, scope *groupCallScope, peer tg.InputPeerClass) (int64, error) {
 	switch v := peer.(type) {
 	case *tg.InputPeerSelf:
-		return currentUserID, nil
+		return scope.userID, nil
 	case *tg.InputPeerUser:
 		return v.UserID, nil
+	case *tg.InputPeerChannel:
+		return r.groupCallTargetByJoinAsChannel(ctx, scope, v.ChannelID)
 	default:
 		return 0, peerIDInvalidErr()
 	}
+}
+
+// groupCallTargetByJoinAsChannel 把频道身份 peer 解析回 participant 行的 UserID
+// （行以 UserID 为唯一键，频道身份只是行上的 JoinAsChannelID）。自己优先——
+// self-edit 是高频路径；再扫会内其余行（ListParticipants 已滤 left 行）。
+// 无人以该身份入会即 PEER_ID_INVALID。
+func (r *Router) groupCallTargetByJoinAsChannel(ctx context.Context, scope *groupCallScope, channelID int64) (int64, error) {
+	if self, found, err := r.deps.GroupCalls.Participant(ctx, scope.call.ID, scope.userID); err != nil {
+		return 0, internalErr()
+	} else if found && !self.Left && self.JoinAsChannelID == channelID {
+		return scope.userID, nil
+	}
+	const pageLimit = 100
+	offset := ""
+	for {
+		page, err := r.deps.GroupCalls.Participants(ctx, scope.call.ID, offset, pageLimit)
+		if err != nil {
+			return 0, internalErr()
+		}
+		for _, p := range page.Participants {
+			if p.JoinAsChannelID == channelID {
+				return p.UserID, nil
+			}
+		}
+		if page.NextOffset == "" {
+			break
+		}
+		offset = page.NextOffset
+	}
+	return 0, peerIDInvalidErr()
 }

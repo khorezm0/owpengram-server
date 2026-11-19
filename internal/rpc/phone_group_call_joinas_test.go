@@ -111,3 +111,70 @@ func TestGroupCallJoinAsChannel(t *testing.T) {
 		t.Fatalf("after identity switch participants = %d, want 1 (replace not add)", len(page2.Participants))
 	}
 }
+
+// TestGroupCallEditParticipantAsJoinAsChannel 覆盖 editGroupCallParticipant 的
+// 频道身份目标解析：tweb/TDesktop 对自己 join-as 的行发 inputPeerChannel（开关
+// 摄像头/静音/举手全走它），对他人的频道身份行发其 peer（admin 禁言/本地音量）。
+// 服务器必须把频道身份解析回以它入会的行，而不是 PEER_ID_INVALID。
+func TestGroupCallEditParticipantAsJoinAsChannel(t *testing.T) {
+	f := newGroupCallFixture(t)
+	ownerCtx := f.userCtx(f.owner, 11)
+	memberCtx := f.userCtx(f.member, 22)
+	channelPeer := &tg.InputPeerChannel{ChannelID: f.channel.ID, AccessHash: f.channel.AccessHash}
+
+	createRes, err := f.router.onPhoneCreateGroupCall(ownerCtx, &tg.PhoneCreateGroupCallRequest{
+		Peer: channelPeer, RandomID: 1,
+	})
+	if err != nil {
+		t.Fatalf("createGroupCall: %v", err)
+	}
+	call := findUpdate[*tg.UpdateGroupCall](t, createRes).Call.(*tg.GroupCall)
+	input := &tg.InputGroupCall{ID: call.ID, AccessHash: call.AccessHash}
+
+	if _, err := f.router.onPhoneJoinGroupCall(ownerCtx, &tg.PhoneJoinGroupCallRequest{
+		Call:   input,
+		JoinAs: channelPeer,
+		Params: groupCallJoinParams(t, 8201),
+	}); err != nil {
+		t.Fatalf("owner joinGroupCall(join_as=channel): %v", err)
+	}
+
+	// self-edit 以频道身份寻址（tweb 开关摄像头的路径）。
+	raise := &tg.PhoneEditGroupCallParticipantRequest{Call: input, Participant: channelPeer}
+	raise.SetRaiseHand(true)
+	res, err := f.router.onPhoneEditGroupCallParticipant(ownerCtx, raise)
+	if err != nil {
+		t.Fatalf("edit self row addressed as channel: %v", err)
+	}
+	row := findUpdate[*tg.UpdateGroupCallParticipants](t, res).Participants[0]
+	if rating, has := row.GetRaiseHandRating(); !has || rating <= 0 {
+		t.Fatalf("raise hand via channel peer = %+v, want rating > 0", row)
+	}
+	if _, ok := row.Peer.(*tg.PeerChannel); !ok {
+		t.Fatalf("row peer = %#v, want PeerChannel", row.Peer)
+	}
+
+	// video_stopped=false（tweb 开摄像头）以频道身份寻址：绝不报错。
+	video := &tg.PhoneEditGroupCallParticipantRequest{Call: input, Participant: channelPeer}
+	video.SetVideoStopped(false)
+	if _, err := f.router.onPhoneEditGroupCallParticipant(ownerCtx, video); err != nil {
+		t.Fatalf("video_stopped=false addressed as channel: %v", err)
+	}
+
+	// 成员对频道身份行设本地音量（memberOverride 路径）。
+	vol := &tg.PhoneEditGroupCallParticipantRequest{Call: input, Participant: channelPeer}
+	vol.SetVolume(6000)
+	if _, err := f.router.onPhoneEditGroupCallParticipant(memberCtx, vol); err != nil {
+		t.Fatalf("member local volume on channel-identity row: %v", err)
+	}
+
+	// 无人以该频道身份入会：PEER_ID_INVALID。
+	unknown := &tg.InputPeerChannel{ChannelID: f.channel.ID + 1, AccessHash: f.channel.AccessHash}
+	bad := &tg.PhoneEditGroupCallParticipantRequest{Call: input, Participant: unknown}
+	bad.SetRaiseHand(true)
+	if _, err := f.router.onPhoneEditGroupCallParticipant(ownerCtx, bad); err == nil {
+		t.Fatalf("edit via unknown channel identity must fail")
+	} else {
+		assertPhoneRPCErr(t, err, "PEER_ID_INVALID")
+	}
+}
